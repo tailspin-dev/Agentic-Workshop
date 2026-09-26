@@ -1,0 +1,13 @@
+- id: "1"
+  title: Triage decision schema
+  description: >-
+    Build the importable triage-decision schema (CAP-1) with category, priority,
+    route and one-sentence rationale, rejecting anything else with a field-named
+    error. Epic 2 uses it as structured output and Epic 3's valid_schema scorer
+    validates against it.
+- id: "2"
+  title: Seed loader
+  description: >-
+    Build load_seed.py (CAP-2) to rebuild app.db's tickets and customers tables
+    from seed/*.csv with the CSV columns, identically on every run, so
+    mcp/triage_server.py works unchanged.
