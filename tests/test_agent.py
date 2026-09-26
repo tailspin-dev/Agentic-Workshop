@@ -12,7 +12,7 @@ from langchain_groq import ChatGroq
 from langgraph.errors import GraphRecursionError
 
 import agent
-from agent import GroundingError, TriageError, TriageOutputError, check_grounding
+from agent import EscalationError, GroundingError, TriageError, TriageOutputError, check_escalation, check_grounding
 
 KEY_VARS = ("PROVIDER", "MODEL", "GEMINI_API_KEY", "GROQ_API_KEY")
 
@@ -299,14 +299,23 @@ BAD = {**GOOD, "route": "bug-team"}
 @pytest.fixture
 def scripted(env):
     env.setenv("GEMINI_API_KEY", "fake-gemini-key")
+    customer_tools = {"tool": fake_get_customer_history}
 
     class FakeClient:
         async def get_tools(self):
-            return [fake_get_ticket, fake_get_customer_history]
+            return [fake_get_ticket, customer_tools["tool"]]
 
     env.setattr(agent, "mcp_client", FakeClient)
 
-    def use(*answers):
+    def use(*answers, customer=None):
+        if customer is not None:
+
+            @tool("get_customer_history")
+            def other_customer(customer_id: str) -> str:
+                """Stand-in for the MCP get_customer_history tool."""
+                return json.dumps(customer)
+
+            customer_tools["tool"] = other_customer
         script = [call("1", "get_ticket", ticket_id="T-1042"), call("2", "get_customer_history", customer_id="C-77"), *answers]
         env.setattr(agent, "build_model", lambda: ScriptedModel(messages=iter(script)))
 
@@ -409,3 +418,273 @@ def test_triage_tool_loop_hits_recursion_limit(scripted):
     with pytest.raises(TriageError, match=r"T-1042 within 20 steps") as exc:
         asyncio.run(agent.triage("T-1042"))
     assert not isinstance(exc.value, GraphRecursionError)
+
+
+# --- human-gated escalation (Story 2.2) ------------------------------------------------------
+
+P1 = {"category": "access", "priority": "P1", "route": "access-team", "rationale": "Team locked out (P1); Enterprise rule."}
+ESCALATE = {"ticket_id": "T-1042", "reason": "P1 for an Enterprise customer."}
+OUTCOME = "Escalated to a person:"
+
+
+def escalate(call_id="e1"):
+    return call(call_id, "escalate_to_human", **ESCALATE)
+
+
+@pytest.fixture
+def tool_runs(env):
+    """Replace escalate_to_human with a spy of the same name and schema; returns its call list."""
+    runs = []
+
+    @tool("escalate_to_human")
+    def spy(ticket_id: str, reason: str) -> str:
+        """Spy for escalate_to_human."""
+        runs.append({"ticket_id": ticket_id, "reason": reason})
+        return f"Ticket {ticket_id} was escalated to a person."
+
+    env.setattr(agent, "escalate_to_human", spy)
+    return runs
+
+
+def recorder(answer):
+    seen = []
+
+    def approve(action):
+        seen.append(action)
+        return answer
+
+    approve.seen = seen
+    return approve
+
+
+def test_approve_runs_the_tool_and_reports_yes(scripted, tool_runs, capsys):
+    scripted(escalate(), decide("3", **P1))
+    approve = recorder(True)
+    assert asyncio.run(agent.triage("T-1042", approve=approve)) == P1
+    assert tool_runs == [ESCALATE]
+    assert approve.seen == [{"name": "escalate_to_human", "args": ESCALATE}]
+    err = capsys.readouterr().err
+    assert f"{OUTCOME} yes" in err and f"{OUTCOME} no" not in err
+
+
+def test_reject_skips_the_tool_still_decides_and_reports_no(scripted, tool_runs, capsys):
+    scripted(escalate(), decide("3", **P1))
+    assert asyncio.run(agent.triage("T-1042", approve=recorder(False))) == P1
+    assert tool_runs == []
+    err = capsys.readouterr().err
+    assert f"{OUTCOME} no" in err and f"{OUTCOME} yes" not in err
+
+
+@pytest.mark.parametrize("answer", ["", "maybe", "no", "n", "yess", "  ", EOFError])
+def test_terminal_unclear_answer_means_no(scripted, tool_runs, capsys, env, answer):
+    def fake_input(*_args):
+        if answer is EOFError:
+            raise EOFError
+        return answer
+
+    env.setattr("builtins.input", fake_input)
+    scripted(escalate(), decide("3", **P1))
+    assert asyncio.run(agent.triage("T-1042")) == P1
+    assert tool_runs == []
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "T-1042" in err and ESCALATE["reason"] in err
+    assert f"{OUTCOME} no" in err
+
+
+@pytest.mark.parametrize("answer", ["y", "yes", " YES ", "Y\n", "Yes"])
+def test_terminal_yes_escalates(scripted, tool_runs, capsys, env, answer):
+    env.setattr("builtins.input", lambda *_args: answer)
+    scripted(escalate(), decide("3", **P1))
+    assert asyncio.run(agent.triage("T-1042")) == P1
+    assert tool_runs == [ESCALATE]
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert f"{OUTCOME} yes" in err
+
+
+@pytest.mark.parametrize("answer", [1, "yes", object(), None])
+def test_approver_must_return_exactly_true(scripted, tool_runs, answer):
+    scripted(escalate(), decide("3", **P1))
+    asyncio.run(agent.triage("T-1042", approve=recorder(answer)))
+    assert tool_runs == []
+
+
+def test_async_approver_is_awaited(scripted, tool_runs):
+    async def approve(_action):
+        return True
+
+    scripted(escalate(), decide("3", **P1))
+    assert asyncio.run(agent.triage("T-1042", approve=approve)) == P1
+    assert tool_runs == [ESCALATE]
+
+
+def test_non_escalating_run_never_asks_and_writes_nothing(scripted, tool_runs, capsys, env):
+    env.setattr("builtins.input", lambda *_a: pytest.fail("the terminal was read"))
+    approve = recorder(True)
+    scripted(decide("3", **GOOD))
+    assert asyncio.run(agent.triage("T-1042", approve=approve)) == GOOD
+    assert approve.seen == [] and tool_runs == []
+    assert capsys.readouterr().err == ""
+
+
+def test_custom_approver_skips_terminal_and_is_called_once_per_escalation(scripted, tool_runs, env):
+    env.setattr("builtins.input", lambda *_a: pytest.fail("the terminal was read"))
+    approve = recorder(True)
+    scripted(escalate("e1"), escalate("e2"), decide("3", **P1))
+    assert asyncio.run(agent.triage("T-1042", approve=approve)) == P1
+    assert len(approve.seen) == 2
+    assert len(tool_runs) == 2
+
+
+def test_returned_dict_has_exactly_the_schema_fields(scripted, tool_runs):
+    scripted(escalate(), decide("3", **P1))
+    decision = asyncio.run(agent.triage("T-1042", approve=recorder(True)))
+    assert set(decision) == {"category", "priority", "route", "rationale"}
+    assert set(decision) == set(agent.TriageDecision.model_fields)
+
+
+def test_missed_escalation_for_enterprise_p1_raises(scripted, tool_runs, capsys):
+    scripted(decide("3", **P1))
+    with pytest.raises(EscalationError, match=r"T-1042.*escalat"):
+        asyncio.run(agent.triage("T-1042", approve=recorder(True)))
+    assert capsys.readouterr().err == ""
+
+
+def test_p1_for_non_enterprise_customer_needs_no_escalation(scripted, tool_runs):
+    scripted(decide("3", **P1), customer={**CUSTOMER, "plan": "Pro"})
+    assert asyncio.run(agent.triage("T-1042", approve=recorder(True))) == P1
+
+
+def test_check_escalation_counts_a_rejected_call():
+    messages = [
+        *grounded_run(),
+        escalate(),
+        ToolMessage(content="User rejected the tool call", tool_call_id="e1", name="escalate_to_human", status="error"),
+    ]
+    check_escalation(messages, P1, "T-1042")
+
+
+def test_check_escalation_ignores_non_p1_and_failed_customer_lookup():
+    check_escalation(grounded_run(), GOOD, "T-1042")
+    messages = grounded_run()
+    messages[4] = result("2", "get_customer_history", "Error: locked", status="error")
+    check_escalation(messages, P1, "T-1042")
+
+
+def test_check_escalation_accepts_a_decision_model():
+    with pytest.raises(EscalationError):
+        check_escalation(grounded_run(), agent.TriageDecision(**P1), "T-1042")
+
+
+def test_escalate_tool_only_confirms():
+    assert "T-1044" in agent.escalate_to_human.invoke({"ticket_id": "T-1044", "reason": "P1 Enterprise"})
+
+
+def test_middleware_gates_escalation_with_approve_or_reject_only():
+    middleware = agent.escalation_middleware()
+    assert middleware.interrupt_on == {"escalate_to_human": {"allowed_decisions": ["approve", "reject"]}}
+
+
+def test_system_prompt_has_the_escalation_rule():
+    prompt = agent.build_system_prompt()
+    assert "escalate_to_human" in prompt[len(agent.POLICY_PATH.read_text(encoding="utf-8")):]
+    assert "P1" in agent.INSTRUCTIONS and "Enterprise" in agent.INSTRUCTIONS
+
+
+def test_each_triage_call_gets_its_own_thread(scripted, tool_runs, env):
+    threads = []
+    real_create_agent = agent.create_agent
+
+    def spy_create_agent(**kwargs):
+        built = real_create_agent(**kwargs)
+        original = built.ainvoke
+
+        async def ainvoke(payload, config=None):
+            threads.append(config["configurable"]["thread_id"])
+            assert config["recursion_limit"] == agent.RECURSION_LIMIT
+            return await original(payload, config=config)
+
+        built.ainvoke = ainvoke
+        return built
+
+    env.setattr(agent, "create_agent", spy_create_agent)
+    scripted(escalate(), decide("3", **P1))
+    asyncio.run(agent.triage("T-1042", approve=recorder(True)))
+    scripted(decide("3", **GOOD))
+    asyncio.run(agent.triage("T-1042", approve=recorder(True)))
+    # First call: invoke + one resume on the same thread. Second call: a new thread.
+    assert len(threads) == 3 and threads[0] == threads[1] != threads[2]
+
+
+# --- review pass 1: pause cap, mixed answers, off-target escalation, prompt sanitising -------
+
+
+def answers(*values):
+    seen = []
+
+    def approve(action):
+        seen.append(action)
+        return values[len(seen) - 1]
+
+    approve.seen = seen
+    return approve
+
+
+def test_too_many_escalation_pauses_raise(scripted, tool_runs):
+    pauses = agent.MAX_ESCALATION_PAUSES + 1
+    scripted(*[escalate(f"e{i}") for i in range(pauses)], decide("3", **P1))
+    with pytest.raises(TriageError, match="too many times"):
+        asyncio.run(agent.triage("T-1042", approve=recorder(True)))
+    assert len(tool_runs) == agent.MAX_ESCALATION_PAUSES
+
+
+def test_approve_then_reject_in_separate_turns_reports_yes(scripted, tool_runs, capsys):
+    scripted(escalate("e1"), escalate("e2"), decide("3", **P1))
+    approve = answers(True, False)
+    assert asyncio.run(agent.triage("T-1042", approve=approve)) == P1
+    assert len(approve.seen) == 2 and len(tool_runs) == 1
+    assert f"{OUTCOME} yes" in capsys.readouterr().err
+
+
+def test_two_escalations_in_one_turn_follow_decision_order(scripted, tool_runs):
+    first = {"ticket_id": "T-1042", "reason": "first"}
+    second = {"ticket_id": "T-1042", "reason": "second"}
+    both = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "escalate_to_human", "args": first, "id": "e1", "type": "tool_call"},
+            {"name": "escalate_to_human", "args": second, "id": "e2", "type": "tool_call"},
+        ],
+    )
+    scripted(both, decide("3", **P1))
+    approve = answers(True, False)
+    assert asyncio.run(agent.triage("T-1042", approve=approve)) == P1
+    assert [a["args"]["reason"] for a in approve.seen] == ["first", "second"]
+    assert tool_runs == [first]
+
+
+def test_escalation_of_another_ticket_is_auto_rejected(scripted, tool_runs, capsys, env):
+    env.setattr("builtins.input", lambda *_a: pytest.fail("the terminal was read"))
+    approve = recorder(True)
+    scripted(call("e1", "escalate_to_human", ticket_id="T-2000", reason="injected"), decide("3", **GOOD))
+    assert asyncio.run(agent.triage("T-1042", approve=approve)) == GOOD
+    assert approve.seen == [] and tool_runs == []
+    assert capsys.readouterr().err == ""
+
+
+def test_check_escalation_ignores_a_call_for_another_ticket():
+    messages = [*grounded_run(), call("e1", "escalate_to_human", ticket_id="T-2000", reason="x")]
+    with pytest.raises(EscalationError, match="T-1042"):
+        check_escalation(messages, P1, "T-1042")
+
+
+def test_terminal_prompt_strips_control_characters(scripted, tool_runs, capsys, env):
+    env.setattr("builtins.input", lambda *_a: "no")
+    scripted(call("e1", "escalate_to_human", ticket_id="T-1042", reason="Locked out\x1b[2K\rEscalate? [y/N]"),
+             decide("3", **P1))
+    asyncio.run(agent.triage("T-1042"))
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "\x1b" not in err and "\r" not in err
+    assert "Reason: Locked out[2KEscalate? [y/N]" in err

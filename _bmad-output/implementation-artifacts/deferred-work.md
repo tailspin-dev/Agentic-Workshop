@@ -5,3 +5,12 @@
 ## Deferred from: code review of 2-seed-loader.md (2026-09-26)
 
 - `_bmad-output/implementation-artifacts/epic-1-context.md` still lists the route-match and sentence-count questions under "Still open in the spec". Story 1.1 settled both: `route_matches_category` rejects mismatched routes, and sentence count is not enforced. Regenerate the epic context after the SPEC.md sync above, so that Epic 2 and 3 builders don't read stale guidance.
+
+## Deferred from: code review of 2-human-gated-escalation.md (2026-09-26)
+
+- source_spec: `_bmad-output/specs/spec-epic-2/stories/2-human-gated-escalation.md`
+  summary: Confirm that a resumed escalation run (invoke plus Command resume) stays in one MLflow trace under run_agent.py's triage span.
+  evidence: Unverified, medium if false; Epic 3's tool_order scorer depends on it. Settle it by running `run_agent.py T-1044`, answering yes, and checking that the trace has a single root with both ainvoke calls nested.
+- source_spec: `_bmad-output/specs/spec-epic-2/stories/2-human-gated-escalation.md`
+  summary: Add a concurrency test that the default terminal approver doesn't block the event loop while waiting for input.
+  evidence: Removing the thread offload passes all tests, but nothing else runs on the loop in the CLI path today, so it becomes relevant only if triage is run concurrently.
