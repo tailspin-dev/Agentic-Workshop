@@ -6,7 +6,8 @@ anything invalid raises pydantic.ValidationError naming the offending field.
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, ValidationInfo, field_validator
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
+from pydantic_core import InitErrorDetails, PydanticCustomError
 
 Category = Literal["billing", "bug", "access", "performance", "how-to"]
 Priority = Literal["P1", "P2", "P3", "P4"]
@@ -34,17 +35,21 @@ class TriageDecision(BaseModel):
     route: Route
     rationale: str
 
-    @field_validator("route")
-    @classmethod
-    def route_matches_category(cls, route: str, info: ValidationInfo) -> str:
-        # category is declared before route, so it is in info.data unless it failed validation.
-        category = info.data.get("category")
-        if category is None:
-            return route
-        expected = ROUTE_FOR_CATEGORY[category]
-        if route != expected:
-            raise ValueError(f"route {route!r} does not match category {category!r}; expected {expected!r}")
-        return route
+    @model_validator(mode="after")
+    def route_matches_category(self) -> "TriageDecision":
+        # A model validator runs on every assignment too, so changing category re-checks the route.
+        # It only runs once every field is valid, so a bad category is reported on its own.
+        expected = ROUTE_FOR_CATEGORY[self.category]
+        if self.route != expected:
+            error = PydanticCustomError(
+                "route_mismatch",
+                "route '{route}' does not match category '{category}'; expected '{expected}'",
+                {"route": self.route, "category": self.category, "expected": expected},
+            )
+            raise ValidationError.from_exception_data(
+                type(self).__name__, [InitErrorDetails(type=error, loc=("route",), input=self.route)]
+            )
+        return self
 
     @field_validator("rationale")
     @classmethod

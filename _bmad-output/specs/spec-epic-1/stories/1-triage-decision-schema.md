@@ -61,14 +61,33 @@ context: ['{project-root}/_bmad-output/specs/spec-epic-1/SPEC.md', '{project-roo
 - Given `TriageDecision.model_json_schema()`, when inspected, then `category`, `priority` and `route` appear as enums with exactly the policy's values, all four fields are required, and `additionalProperties` is false.
 - Given a valid decision, when `json.dumps(decision.model_dump())` runs, then it produces the same four keys and values.
 
+### Review Findings
+
+Pass 2 (2026-09-26; blind-hunter, edge-case-hunter, verification-gap, acceptance-auditor).
+
+- [x] [Review][Patch] Assigning `category` after validation skips the route check — move the pairing check to a `model_validator(mode="after")` that raises with `loc` `route`, and add a test that assigns `category` (decision: Kris, 2026-09-26) [triage_schema.py:38]
+- [x] [Review][Patch] No test pins that a padded rationale is kept verbatim; `return rationale.strip()` or `str_strip_whitespace=True` would pass all 35 tests [tests/test_triage_schema.py:91]
+- [x] [Review][Patch] Whitespace-only rationale cases cover spaces only; add `"\n\t"` [tests/test_triage_schema.py:91]
+- [x] [Review][Patch] Non-object test asserts only that `ValidationError` is raised; assert the error type and add a bare string and an int [tests/test_triage_schema.py:104]
+- [x] [Review][Defer] SPEC.md still lists the route-match and sentence-count questions as open, and CAP-1 says any in-vocabulary route "passes" [_bmad-output/specs/spec-epic-1/SPEC.md:49] — deferred: needs `/bmad-spec` on the epic spec, outside this story
+
+**Rejected**
+- `false` — `validate_assignment=True` not in the task's ConfigDict: it only tightens validation and is recorded in the triage log.
+- `false` — Gemini may not accept the schema: `langchain_google_genai` converts it offline; only `additionalProperties` is dropped (with a warning), and `extra="forbid"` still enforces it on validation.
+- `low` — Story metadata inconsistent (row #12 says story file excluded from diff; `status: done` / `review_loop_iteration: 0` before review): fix edits the spec under review.
+- `low` — JSON schema doesn't express category→route pairing: already rejected in pass 1 (row #10); encoding it needs `oneOf`.
+- `low` — Tests copy vocabularies by hand instead of parsing `TRIAGE_POLICY.md`: the policy is read-only; parsing Markdown adds fragile code.
+- `low` — No `Field(description=...)` for structured output: prompt guidance belongs to Epic 2; adds surface with no demonstrated harm.
+- `low` — `ROUTE_FOR_CATEGORY` is a mutable dict: no caller mutates it; guards undemonstrated state.
+
 ## Implementation Notes
 
 - Implemented directly in the session (no subagent). Files: `triage_schema.py`, `tests/test_triage_schema.py`, `pyproject.toml`.
-- Route/category check is a `field_validator` on `route` reading `info.data["category"]`, so the error's `loc` is `route`; it is skipped when the category itself is invalid (that error is reported instead). `ROUTE_FOR_CATEGORY` is exported for Epic 2/3 reuse.
+- Route/category check is a `model_validator(mode="after")` that raises a `route_mismatch` error with `loc` `route`. It runs on creation and on every assignment (review pass 2 moved it from a `field_validator`, which let `d.category = ...` bypass it). It does not run when a field is invalid, so a bad category is reported on its own. A failed assignment raises but leaves the instance holding the assigned value (pydantic behaviour). `ROUTE_FOR_CATEGORY` is exported for Epic 2/3 reuse.
 - Blank-rationale check does not strip the stored value, so `model_dump()` returns input unchanged.
 - A JSON *string* of a valid object is rejected by `model_validate` (not an object); callers holding JSON text use `model_validate_json`.
 - Review pass 1 patches (see triage log): `validate_assignment=True`, map typed `dict[Category, Route]`, docstring reworded, tests tightened and extended.
-- Verification: `uv run pytest` with `GEMINI_API_KEY`/`GROQ_API_KEY` unset → 35 passed (26 before review); `model_json_schema()` shows three enums, four required fields, `additionalProperties: false`.
+- Verification: `uv run pytest` with `GEMINI_API_KEY`/`GROQ_API_KEY` unset → 40 passed after review pass 2 (35 after pass 1, 26 before review); `model_json_schema()` shows three enums, four required fields, `additionalProperties: false`.
 
 ## Spec Change Log
 

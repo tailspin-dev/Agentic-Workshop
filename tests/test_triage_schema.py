@@ -87,9 +87,14 @@ def test_multi_sentence_rationale_is_accepted():
     TriageDecision.model_validate({**VALID, "rationale": "Charged twice. Money at stake, so P2."})
 
 
-@pytest.mark.parametrize("rationale", ["", "   "])
+@pytest.mark.parametrize("rationale", ["", "   ", "\n\t"])
 def test_blank_rationale_is_rejected(rationale):
     assert rejected_fields({**VALID, "rationale": rationale}) == {"rationale"}
+
+
+def test_padded_rationale_is_kept_verbatim():
+    data = {**VALID, "rationale": "  Double charge puts money at stake (P2). "}
+    assert TriageDecision.model_validate(data).model_dump() == data
 
 
 @pytest.mark.parametrize(
@@ -100,10 +105,11 @@ def test_wrong_type_is_rejected_without_coercion(field, value):
     assert rejected_fields({**VALID, field: value}) == {field}
 
 
-@pytest.mark.parametrize("data", [[VALID], json.dumps(VALID), None])
+@pytest.mark.parametrize("data", [[VALID], json.dumps(VALID), "hello", 42, None])
 def test_non_object_is_rejected(data):
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError) as exc:
         TriageDecision.model_validate(data)
+    assert [error["type"] for error in exc.value.errors()] == ["model_type"]
 
 
 def test_json_text_validates():
@@ -120,6 +126,13 @@ def test_assignment_is_validated():
         decision.route = "bug-team"
     with pytest.raises(ValidationError):
         decision.priority = "P5"
+
+
+def test_assigning_category_rechecks_route():
+    decision = TriageDecision.model_validate(VALID)
+    with pytest.raises(ValidationError) as exc:
+        decision.category = "bug"
+    assert {str(loc) for error in exc.value.errors() for loc in error["loc"]} == {"route"}
 
 
 def test_vocabularies_match_policy():
