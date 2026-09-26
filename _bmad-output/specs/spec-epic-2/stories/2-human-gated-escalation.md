@@ -128,6 +128,13 @@ context: ['{project-root}/_bmad-output/specs/spec-epic-2/SPEC.md', '{project-roo
   The finding stands and the fix is verified.
 - **Live acceptance runs not done:** T-1044 answered yes and then no, and T-1042. Gemini's free tier returned 429 (20 requests per day used up) and `GROQ_API_KEY` is empty. The real middleware interrupt/resume against a live model, and the one-trace behaviour (deferred), are still unexercised.
 
+- **Live acceptance on Groq** (`PROVIDER=groq`, `openai/gpt-oss-120b`, 2026-09-26). All three acceptance criteria pass:
+  - T-1042: no prompt, `billing`/`P2`/`billing-team`.
+  - T-1044 answered `yes`: the prompt shows the ticket and reason, then `Escalated to a person: yes`, then `access`/`P1`/`access-team`.
+  - T-1044 answered `no`: `Escalated to a person: no`, same decision. (The first `no` attempt hit Groq's 8k tokens-per-minute limit; the retry passed.)
+- **One-trace check (the deferred item), settled from `mlflow.db`:** each resumed T-1044 run is a single trace. One `triage` root has both LangGraph invokes nested under it. The yes-run includes the `escalate_to_human` tool span, and the no-run does not.
+- **Known noise:** each pause and resume logs `Error in MlflowLangchainTracer.on_interrupt/on_resume callback: AttributeError`. The installed MLflow tracer lacks LangGraph's new interrupt callbacks. The run and trace are unaffected. This is recorded in `deferred-work.md`.
+
 ## Spec Change Log
 
 ## Review Triage Log

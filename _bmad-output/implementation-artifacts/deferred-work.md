@@ -14,3 +14,9 @@
 - source_spec: `_bmad-output/specs/spec-epic-2/stories/2-human-gated-escalation.md`
   summary: Add a concurrency test that the default terminal approver doesn't block the event loop while waiting for input.
   evidence: Removing the thread offload passes all tests, but nothing else runs on the loop in the CLI path today, so it becomes relevant only if triage is run concurrently.
+- source_spec: `_bmad-output/specs/spec-epic-2/stories/2-human-gated-escalation.md`
+  summary: Silence or fix the `MlflowLangchainTracer.on_interrupt/on_resume` AttributeError noise printed on every escalation pause and resume.
+  evidence: Seen live on T-1044 (2026-09-26). The installed MLflow tracer doesn't implement LangGraph's interrupt/resume callbacks. Runs and traces are unaffected, but the error text sits next to the `Escalate? [y/N]` prompt. Fix by upgrading MLflow once it supports these callbacks, or by filtering this log in run_agent.py.
+- source_spec: `_bmad-output/specs/spec-epic-2/stories/2-human-gated-escalation.md`
+  summary: RESOLVED: the one-trace check for resumed escalation runs (earlier entry).
+  evidence: Live T-1044 runs on Groq each produced one trace with a single `triage` root and both LangGraph invokes nested under it.
